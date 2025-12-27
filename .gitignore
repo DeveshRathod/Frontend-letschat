@@ -1,0 +1,22 @@
+# Terraform local state
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Terraform directories
+.terraform/
+.terraform.lock.hcl
+
+# Backend config
+backend.hcl
+environments/*/backend.hcl
+
+# Local overrides
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# tfvars
+tfvars/*.tfvars
+*.tfvars
