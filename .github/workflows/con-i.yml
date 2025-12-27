@@ -1,0 +1,210 @@
+name: CI Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, test, prod]
+        default: dev
+
+      deploy:
+        description: 'Run deployment after build?'
+        required: true
+        type: choice
+        options: ["true", "false"]
+        default: "false"
+
+jobs:
+
+  # ---------------------------------------------------------
+  # 1) Generate short SHA tag once, globally
+  # ---------------------------------------------------------
+  image_tag:
+    runs-on: ci-runner
+    outputs:
+      tag: ${{ steps.get_tag.outputs.tag }}
+    steps:
+      - name: Generate short SHA image tag
+        id: get_tag
+        run: echo "tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+
+  # ---------------------------------------------------------
+  # 2) Sonar Scan
+  # ---------------------------------------------------------
+  sonar_scan:
+    runs-on: ci-runner
+    needs: image_tag
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      SONAR_URL: ${{ vars.sonar_url }}
+      SONAR_TOKEN: ${{ secrets.sonar_token }}
+      PROJECT_NAME: ${{ vars.project_name }}
+      DOCKER_VERSION: ${{ needs.image_tag.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run SonarQube Scan
+        run: |
+          /opt/sonar-scanner/bin/sonar-scanner \
+            -Dsonar.projectKey=$PROJECT_NAME \
+            -Dsonar.sources=. \
+            -Dsonar.host.url=$SONAR_URL \
+            -Dsonar.login=$SONAR_TOKEN
+
+
+  # ---------------------------------------------------------
+  # 3) Docker Build
+  # ---------------------------------------------------------
+  docker_build:
+    runs-on: ci-runner
+    needs: [sonar_scan, image_tag]
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      PROJECT_NAME: ${{ vars.project_name }}
+      DOCKER_VERSION: ${{ needs.image_tag.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t $PROJECT_NAME:$DOCKER_VERSION .
+
+      - name: Save Docker image
+        run: docker save $PROJECT_NAME:$DOCKER_VERSION -o $PROJECT_NAME-$DOCKER_VERSION.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-image-${{ env.DOCKER_VERSION }}
+          path: ${{ env.PROJECT_NAME }}-${{ env.DOCKER_VERSION }}.tar
+
+
+  # ---------------------------------------------------------
+  # 4) Trivy Image Scan
+  # ---------------------------------------------------------
+  image_scan:
+    runs-on: ci-runner
+    needs: [docker_build, image_tag]
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      PROJECT_NAME: ${{ vars.project_name }}
+      DOCKER_VERSION: ${{ needs.image_tag.outputs.tag }}
+      TRIVY_CACHE_DIR: /tmp/trivy-cache
+
+    steps:
+      - name: Restore Trivy cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/trivy-cache
+          key: trivy-db-${{ runner.os }}
+          restore-keys: |
+            trivy-db-
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-image-${{ env.DOCKER_VERSION }}
+          path: .
+
+      - name: Run Trivy image scan
+        run: |
+          mkdir -p trivy-reports
+          trivy image \
+            --input ${PROJECT_NAME}-${DOCKER_VERSION}.tar \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-reports/${PROJECT_NAME}_${DOCKER_VERSION}_trivy.json
+
+      - name: Upload Trivy report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-scan-${{ env.PROJECT_NAME }}-${{ env.DOCKER_VERSION }}
+          path: trivy-reports
+
+
+  # ---------------------------------------------------------
+  # 5) Upload Scan Report to S3
+  # ---------------------------------------------------------
+  upload_scan:
+    runs-on: ci-runner
+    needs: [image_scan, image_tag]
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      PROJECT_NAME: ${{ vars.project_name }}
+      DOCKER_VERSION: ${{ needs.image_tag.outputs.tag }}
+      S3_BUCKET: ${{ vars.s3_bucket }}
+      AWS_REGION: ${{ vars.aws_region }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    steps:
+      - name: Download Trivy report
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-scan-${{ env.PROJECT_NAME }}-${{ env.DOCKER_VERSION }}
+          path: trivy-reports
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp trivy-reports/ \
+            s3://${S3_BUCKET}/${PROJECT_NAME}/${DOCKER_VERSION}/ \
+            --recursive --region "${AWS_REGION}"
+
+
+  # ---------------------------------------------------------
+  # 6) Upload Docker Image to Registry
+  # ---------------------------------------------------------
+  upload_registry:
+    runs-on: ci-runner
+    needs: [image_scan, image_tag]
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      PROJECT_NAME: ${{ vars.project_name }}
+      DOCKER_VERSION: ${{ needs.image_tag.outputs.tag }}
+      DOCKER_USERNAME: ${{ vars.docker_username }}
+      DOCKER_PASSWORD: ${{ secrets.docker_password }}
+
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-image-${{ env.DOCKER_VERSION }}
+
+      - name: Load image
+        run: docker load -i $PROJECT_NAME-$DOCKER_VERSION.tar
+
+      - name: Login & push
+        run: |
+          echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+          docker tag $PROJECT_NAME:$DOCKER_VERSION $DOCKER_USERNAME/$PROJECT_NAME:$DOCKER_VERSION
+          docker push $DOCKER_USERNAME/$PROJECT_NAME:$DOCKER_VERSION
+
+
+  # ---------------------------------------------------------
+  # 7) Deploy to Environment
+  # ---------------------------------------------------------
+  deploy:
+    needs: [upload_registry, upload_scan, image_tag]
+    if: ${{ github.event.inputs.deploy == 'true' }}
+    uses: ./.github/workflows/con-d.yml
+    with:
+      tag: ${{ needs.image_tag.outputs.tag }}
+      environment: ${{ github.event.inputs.environment }}
+
+
+  # ---------------------------------------------------------
+  # 8) Cleanup
+  # ---------------------------------------------------------
+  clean_up:
+    runs-on: ci-runner
+    needs: [deploy]
+    steps:
+      - name: Cleanup
+        run: |
+          docker system prune -af
+          rm -rf ~/.cache/trivy

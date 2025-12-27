@@ -1,0 +1,175 @@
+name: CD Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Docker tag to deploy"
+        required: true
+        type: string
+      environment:
+        description: "Target environment"
+        required: true
+        type: string
+
+jobs:
+
+  # ---------------------------------------------------------
+  # 1) Terraform Init
+  # ---------------------------------------------------------
+  terraform_init:
+    runs-on: cd-runner
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: terraform
+
+      - name: Set ENV variables
+        run: |
+          echo "ENV=${{ inputs.environment }}" >> $GITHUB_ENV
+          echo "IMAGE=${{ vars.docker_username }}/${{ vars.project_name }}:${{ inputs.tag }}" >> $GITHUB_ENV
+          echo "S3_BUCKET=${{ vars.s3_bucket }}" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ vars.aws_region }}" >> $GITHUB_ENV
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+
+      - name: Download backend config
+        run: |
+          aws s3 cp \
+            s3://${S3_BUCKET}/backends/${ENV}-backend.hcl \
+            env-backend.hcl \
+            --region ${AWS_REGION}
+
+      - name: Terraform Init
+        run: |
+          cd environments/${ENV}
+          mv ../../env-backend.hcl .
+          terraform init -backend-config=env-backend.hcl
+
+
+  # ---------------------------------------------------------
+  # 2) Terraform Plan
+  # ---------------------------------------------------------
+  terraform_plan:
+    runs-on: cd-runner
+    environment: ${{ inputs.environment }}
+    needs: terraform_init
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: terraform
+
+      - name: Reload ENV variables
+        run: |
+          echo "ENV=${{ inputs.environment }}" >> $GITHUB_ENV
+          echo "IMAGE=${{ vars.docker_username }}/${{ vars.project_name }}:${{ inputs.tag }}" >> $GITHUB_ENV
+          echo "S3_BUCKET=${{ vars.s3_bucket }}" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ vars.aws_region }}" >> $GITHUB_ENV
+
+      - name: Download backend config
+        run: |
+          aws s3 cp \
+            s3://${S3_BUCKET}/backends/${ENV}-backend.hcl \
+            env-backend.hcl \
+            --region ${AWS_REGION}
+
+      - name: Download tfvars
+        run: |
+          aws s3 cp \
+            s3://${S3_BUCKET}/tfvars/${ENV}.tfvars \
+            plan.tfvars \
+            --region ${AWS_REGION}
+
+      - name: Terraform Init
+        run: |
+          cd environments/${ENV}
+          mv ../../env-backend.hcl .
+          terraform init -backend-config=env-backend.hcl
+
+      - name: Terraform Format Check
+        run: |
+          cd environments/${ENV}
+          terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: |
+          cd environments/${ENV}
+          terraform validate
+
+      - name: Update Image Version
+        run: |
+          sed -i 's|ecs_image *= *".*"|ecs_image = "'"${IMAGE}"'"|' plan.tfvars
+
+      - name: Terraform Plan
+        run: |
+          cd environments/${ENV}
+          mv ../../plan.tfvars .
+          terraform plan -var-file=plan.tfvars -out=tfplan
+          terraform show -json tfplan > tfplan.json
+
+      - name: Upload Terraform Plan Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-plan-${{ inputs.environment }}-${{ github.run_id }}
+          path: |
+            environments/${{ inputs.environment }}/tfplan
+            environments/${{ inputs.environment }}/tfplan.json
+
+
+  # ---------------------------------------------------------
+  # 3) Terraform Apply
+  # ---------------------------------------------------------
+  terraform_apply:
+    runs-on: cd-runner
+    needs: terraform_plan
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: terraform
+
+      - name: Reload ENV variables
+        run: |
+          echo "ENV=${{ inputs.environment }}" >> $GITHUB_ENV
+          echo "IMAGE=${{ vars.docker_username }}/${{ vars.project_name }}:${{ inputs.tag }}" >> $GITHUB_ENV
+          echo "S3_BUCKET=${{ vars.s3_bucket }}" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ vars.aws_region }}" >> $GITHUB_ENV
+
+      - name: Download backend config
+        run: |
+          aws s3 cp \
+            s3://${S3_BUCKET}/backends/${ENV}-backend.hcl \
+            env-backend.hcl \
+            --region ${AWS_REGION}
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tf-plan-${{ inputs.environment }}-${{ github.run_id }}
+          path: environments/${{ inputs.environment }}
+
+      - name: Terraform Init
+        run: |
+          cd environments/${ENV}
+          mv ../../env-backend.hcl .
+          terraform init -backend-config=env-backend.hcl
+
+      - name: Terraform Apply
+        run: |
+          cd environments/${ENV}
+          terraform apply -auto-approve tfplan
+
+      - name: Capture Terraform Output
+        run: |
+          cd environments/${ENV}
+          terraform output -json > tf-output.json
+
+      - name: Upload Terraform Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-output-${{ inputs.environment }}-${{ github.run_id }}
+          path: environments/${{ inputs.environment }}/tf-output.json
