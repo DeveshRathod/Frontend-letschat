@@ -38,7 +38,7 @@ jobs:
       - name: Download backend config
         run: |
           aws s3 cp \
-            s3://${S3_BUCKET}/backends/${ENV}-backend.hcl \
+            s3://${S3_BUCKET}/frontend-backends/${ENV}-backend.hcl \
             env-backend.hcl \
             --region ${AWS_REGION}
 
@@ -72,14 +72,14 @@ jobs:
       - name: Download backend config
         run: |
           aws s3 cp \
-            s3://${S3_BUCKET}/backends/${ENV}-backend.hcl \
+            s3://${S3_BUCKET}/frontend-backends/${ENV}-backend.hcl \
             env-backend.hcl \
             --region ${AWS_REGION}
 
       - name: Download tfvars
         run: |
           aws s3 cp \
-            s3://${S3_BUCKET}/tfvars/${ENV}.tfvars \
+            s3://${S3_BUCKET}/frontend-tfvars/${ENV}.tfvars \
             plan.tfvars \
             --region ${AWS_REGION}
 
@@ -142,7 +142,7 @@ jobs:
       - name: Download backend config
         run: |
           aws s3 cp \
-            s3://${S3_BUCKET}/backends/${ENV}-backend.hcl \
+            s3://${S3_BUCKET}/frontend-backends/${ENV}-backend.hcl \
             env-backend.hcl \
             --region ${AWS_REGION}
 
